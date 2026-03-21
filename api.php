@@ -16,7 +16,6 @@ $max_pages = (int)($_GET['max_pages'] ?? 500); // Increased for comprehensive sc
 $delay_min = (int)($_GET['delay_min'] ?? 3);    // Min delay between requests (seconds)
 $delay_max = (int)($_GET['delay_max'] ?? 7);    // Max delay between requests (seconds)
 $max_total_time = (int)($_GET['max_time'] ?? 3600); // Max runtime 1hr default
-=======
 error_log("Fetching posts for @$username");
 
 $start_time = microtime(true);
@@ -31,7 +30,6 @@ $html = fetch_url("www.instagram.com", "/$username/", [
 
 error_log("Profile HTML: status={$html['status']}, length=" . strlen($html['body']));
 error_log("Config: max_pages=$max_pages, delay=$delay_min-$delay_max, max_time=$max_total_time");
-=======
 
 if ($html['status'] !== 200) {
     http_response_code($html['status']);
