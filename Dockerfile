@@ -7,7 +7,7 @@ RUN a2enmod rewrite
 WORKDIR /var/www/html
 
 # Copy PHP API
-COPY get_posts.php .
+COPY api.php .
 
 # Expose port 8080
 EXPOSE 8080
