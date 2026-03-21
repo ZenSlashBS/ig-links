@@ -11,13 +11,8 @@ header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET');
 header('Access-Control-Allow-Headers: Content-Type');
 
-if (!isset($_GET['username']) || empty(trim($_GET['username']))) {
-    http_response_code(400);
-    echo json_encode(['error' => 'Username parameter required']);
-    exit;
-}
-
-$username = trim($_GET['username']);
+$username = trim($_GET['username'] ?? '');
+$max_pages = (int)($_GET['max_pages'] ?? 50);
 error_log("Fetching posts for @$username");
 
 $start_time = microtime(true);
@@ -31,6 +26,7 @@ $html = fetch_url("www.instagram.com", "/$username/", [
 ]);
 
 error_log("Profile HTML: status={$html['status']}, length=" . strlen($html['body']));
+error_log("Config: max_pages=$max_pages, delay=$delay_min-$delay_max");
 
 if ($html['status'] !== 200) {
     http_response_code($html['status']);
@@ -68,7 +64,7 @@ $page_n = 0;
 
 do {
     $page_n++;
-    $path = "/api/v1/feed/user/$user_id/?count=24";
+    $path = "/api/v1/feed/user/$user_id/?count=30";
     if ($max_id) {
         $path .= '&max_id=' . urlencode($max_id);
     }
@@ -125,7 +121,9 @@ do {
     error_log("Page $page_n +$new_count posts, total=" . count($all_urls) . ", more_available=$more_available, next_max_id=" . substr($next_max_id, 0, 20) . "...");
 
     $max_id = $next_max_id;
-    usleep((600000 + mt_rand(0, 500000))); // 0.6-1.1s delay - slower to avoid rate limit
+    $delay_us = ($delay_min * 1000000) + mt_rand(0, ($delay_max - $delay_min) * 1000000);
+    usleep($delay_us);
+    error_log("Sleep page $page_n: " . round($delay_us / 1000000, 1) . "s");
 
 } while ($more_available && $next_max_id);
 
@@ -139,7 +137,12 @@ $response = [
     'count' => count($all_urls),
     'took_seconds' => $duration,
     'pages_fetched' => $page_n,
-    'user_id' => $user_id
+    'user_id' => $user_id,
+    'config' => [
+        'max_pages' => $max_pages,
+        'delay_range' => "$delay_min-$delay_max",
+        'stopped_reason' => $page_n >= $max_pages ? 'max_pages' : ($more_available ? 'no_next_max_id' : 'no_more_available')
+    ]
 ];
 
 if ($debug) {
