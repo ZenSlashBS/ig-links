@@ -30,50 +30,32 @@ if (!isset($_GET['username']) || empty(trim($_GET['username']))) {
 $username = trim($_GET['username']);
 $debug = isset($_GET['debug']) && $_GET['debug'];
 
-$cookie_jar = tempnam(sys_get_temp_dir(), 'ig_');
-
 log_msg("============ START @$username ============");
 
 $start_time = microtime(true);
 
-// ── Step 1: Fetch profile page for cookies + user_id ──
-log_msg("[STEP 1] GET https://www.instagram.com/$username/");
+// ── Step 1: Fetch profile HTML -> user_id ──
+log_msg("[STEP 1] Fetching profile: https://www.instagram.com/$username/");
 
-$html = fetch_url(
-    "https://www.instagram.com/$username/",
-    [
-        'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Sec-Fetch-Dest: document',
-        'Sec-Fetch-Mode: navigate',
-        'Sec-Fetch-Site: none',
-        'Upgrade-Insecure-Requests: 1',
-    ],
-    $cookie_jar
-);
+$html = fetch_url("www.instagram.com", "/$username/", [
+    'Accept' => 'text/html,application/xhtml+xml,*/*',
+    'Sec-Fetch-Dest' => 'document',
+    'Sec-Fetch-Mode' => 'navigate',
+    'Upgrade-Insecure-Requests' => '1',
+]);
 
-log_msg("[STEP 1] HTTP {$html['status']} | " . strlen($html['body']) . " bytes | " . ($html['error'] ?: 'OK'));
+log_msg("[STEP 1] HTTP {$html['status']} | " . strlen($html['body']) . " bytes");
 
 if ($html['status'] !== 200) {
-    cleanup($cookie_jar);
-    http_response_code($html['status'] ?: 502);
+    http_response_code($html['status']);
     echo json_encode(['error' => "HTTP {$html['status']} fetching profile"]);
     exit;
-}
-
-// Extract CSRF token
-$csrf_token = '';
-if (file_exists($cookie_jar)) {
-    $cc = file_get_contents($cookie_jar);
-    if (preg_match('/csrftoken\s+(\S+)/', $cc, $cm)) {
-        $csrf_token = $cm[1];
-        log_msg("[STEP 1] CSRF: " . substr($csrf_token, 0, 12) . "...");
-    }
 }
 
 // ── Step 2: Extract user_id ──
 $user_id = null;
 
-if (preg_match('/"user_id"\s*:\s*"(\d+)"/', $html['body'], $m)) {
+if (preg_match('/"user_id":"(\d+)"/', $html['body'], $m)) {
     $user_id = $m[1];
     log_msg("[STEP 2] user_id=$user_id (method: user_id field)");
 }
@@ -81,83 +63,54 @@ if (!$user_id && preg_match('/"profilePage_(\d+)"/', $html['body'], $m)) {
     $user_id = $m[1];
     log_msg("[STEP 2] user_id=$user_id (method: profilePage)");
 }
-if (!$user_id && preg_match('/"id"\s*:\s*"(\d+)"\s*,\s*"username"\s*:\s*"' . preg_quote($username, '/') . '"/i', $html['body'], $m)) {
-    $user_id = $m[1];
-    log_msg("[STEP 2] user_id=$user_id (method: id+username)");
-}
-
-// Fallback: web_profile_info
-if (!$user_id) {
-    log_msg("[STEP 2] Trying web_profile_info API...");
-    usleep(500000);
-    $papi = fetch_url(
-        "https://www.instagram.com/api/v1/users/web_profile_info/?username=" . urlencode($username),
-        [
-            'Accept: application/json',
-            'X-IG-App-ID: 936619743392459',
-            'X-Requested-With: XMLHttpRequest',
-            "X-CSRFToken: $csrf_token",
-            "Referer: https://www.instagram.com/$username/",
-            'Sec-Fetch-Dest: empty',
-            'Sec-Fetch-Mode: cors',
-            'Sec-Fetch-Site: same-origin',
-        ],
-        $cookie_jar
-    );
-    log_msg("[STEP 2] web_profile_info: HTTP {$papi['status']}");
-    if ($papi['status'] === 200) {
-        $pd = json_decode($papi['body'], true);
-        $user_id = $pd['data']['user']['id'] ?? null;
-        if ($user_id) log_msg("[STEP 2] user_id=$user_id (method: web_profile_info)");
-    }
-}
 
 if (!$user_id) {
-    cleanup($cookie_jar);
     log_msg("[STEP 2] FAILED — no user_id found");
-    http_response_code(404);
     $err = ['error' => 'Could not find user_id (private/deleted/geo-blocked?)'];
     if ($debug) {
         $err['html_length'] = strlen($html['body']);
-        $err['html_snippet'] = substr($html['body'], 0, 2000);
+        $err['html_preview'] = substr($html['body'], 0, 1000);
+        $err['regex_test'] = preg_match('/"user_id"/', $html['body'])
+            ? 'user_id key found but no match'
+            : 'user_id key missing entirely';
     }
+    http_response_code(404);
     echo json_encode($err, JSON_PRETTY_PRINT);
     exit;
 }
 
-// ── Step 3: Paginate feed ──
+// ── Step 3: Paginate feed API ──
 log_msg("============ PAGINATING user_id=$user_id ============");
 
 $all_urls = [];
 $seen_pks = [];
 $max_id = '';
 $page_n = 0;
-$more_available = true;
+$more_available = false;
 $next_max_id = '';
 $consecutive_empty = 0;
 $consecutive_fails = 0;
-$total_api_items = 0;
 $total_retries = 0;
 $rate_limit_hits = 0;
-$page_success = true;
 
 do {
     $page_n++;
 
-    $api_url = "https://www.instagram.com/api/v1/feed/user/$user_id/?count=33";
-    if ($max_id !== '') {
-        $api_url .= '&max_id=' . urlencode($max_id);
+    // Same path format as the working JS/Python: /api/v1/feed/user/{id}/?count=12
+    $path = "/api/v1/feed/user/$user_id/?count=12";
+    if ($max_id) {
+        $path .= '&max_id=' . urlencode($max_id);
     }
 
-    log_msg("[PAGE $page_n] GET $api_url");
+    log_msg("[PAGE $page_n] GET https://www.instagram.com$path");
 
-    // Quick retry: max 3 attempts, short backoff
+    // Retry loop: max 3 quick retries
     $resp = null;
-    $page_success = false;
+    $page_ok = false;
 
     for ($retry = 0; $retry < 3; $retry++) {
         if ($retry > 0) {
-            $wait = 5 * $retry + mt_rand(1, 5);
+            $wait = 3 * $retry + mt_rand(1, 3);
             $total_retries++;
             log_msg("[PAGE $page_n] RETRY $retry/3 — wait {$wait}s");
             sleep($wait);
@@ -165,48 +118,48 @@ do {
 
         $req_start = microtime(true);
 
-        $resp = fetch_url($api_url, [
-            'Accept: application/json',
-            'X-IG-App-ID: 936619743392459',
-            'X-Requested-With: XMLHttpRequest',
-            "X-CSRFToken: $csrf_token",
-            "Referer: https://www.instagram.com/$username/",
-            'Sec-Fetch-Dest: empty',
-            'Sec-Fetch-Mode: cors',
-            'Sec-Fetch-Site: same-origin',
-        ], $cookie_jar);
+        // EXACT same headers as the working code + JS/Python reference
+        $resp = fetch_url("www.instagram.com", $path, [
+            'X-IG-App-ID' => '1217981644879628',
+            'Referer' => "https://www.instagram.com/$username/",
+            'Sec-Fetch-Dest' => 'empty',
+            'Sec-Fetch-Mode' => 'cors',
+            'Sec-Fetch-Site' => 'same-origin',
+        ]);
 
         $req_time = round(microtime(true) - $req_start, 2);
         log_msg("[PAGE $page_n] HTTP {$resp['status']} | " . strlen($resp['body']) . " bytes | {$req_time}s");
 
         if ($resp['status'] === 200) {
-            $page_success = true;
+            $page_ok = true;
             $consecutive_fails = 0;
             break;
         }
 
         if (in_array($resp['status'], [429, 401, 403])) {
             $rate_limit_hits++;
-            log_msg("[PAGE $page_n] RATE LIMITED ({$resp['status']}) — hit #$rate_limit_hits");
+            log_msg("[PAGE $page_n] RATE LIMITED ({$resp['status']}) — total hits: $rate_limit_hits");
         }
+
+        log_msg("[PAGE $page_n] Response preview: " . substr($resp['body'], 0, 200));
     }
 
-    if (!$page_success) {
+    if (!$page_ok) {
         $consecutive_fails++;
-        log_msg("[PAGE $page_n] FAILED after retries (consecutive_fails=$consecutive_fails)");
+        log_msg("[PAGE $page_n] FAILED (consecutive=$consecutive_fails)");
         if ($consecutive_fails >= 2) {
-            log_msg("[PAGE $page_n] STOPPING: 2 consecutive failed pages");
+            log_msg("STOPPING: 2 consecutive failed pages");
             break;
         }
-        // Skip this page, try next with same max_id after a pause
-        sleep(10);
+        sleep(5);
         continue;
     }
 
     // Parse JSON
     $body = $resp['body'];
-    if (!preg_match('/^\s*[\{\$]/', $body)) {
+    if (!preg_match('/^\s*\{/', $body)) {
         log_msg("[PAGE $page_n] NOT JSON — stopping");
+        log_msg("[PAGE $page_n] Preview: " . substr($body, 0, 200));
         break;
     }
 
@@ -217,31 +170,30 @@ do {
     }
 
     $items = $data['items'] ?? [];
-    $more_available = (bool)($data['more_available'] ?? false);
-    $next_max_id = (string)($data['next_max_id'] ?? '');
+    $more_available = $data['more_available'] ?? false;
+    $next_max_id = $data['next_max_id'] ?? '';
 
     // Process items
     $new_count = 0;
     $dupes = 0;
     foreach ($items as $item) {
-        $total_api_items++;
         $pk = (string)($item['pk'] ?? $item['id'] ?? '');
-        if ($pk === '' || isset($seen_pks[$pk])) {
+        if (!$pk || isset($seen_pks[$pk])) {
             $dupes++;
             continue;
         }
         $seen_pks[$pk] = true;
 
         $url = item_to_url($item);
-        if ($url !== null) {
+        if ($url) {
             $all_urls[] = $url;
             $new_count++;
         }
     }
 
-    log_msg("[PAGE $page_n] +$new_count new | $dupes dupes | total=" . count($all_urls) . " | more=$more_available | next=" . ($next_max_id ? substr($next_max_id, 0, 15) . '...' : 'NONE'));
+    log_msg("[PAGE $page_n] +$new_count new | $dupes dupes | total=" . count($all_urls) . " | more=" . ($more_available ? 'Y' : 'N') . " | next=" . ($next_max_id ? substr($next_max_id, 0, 20) . '...' : 'NONE'));
 
-    // Sample URL
+    // Log one sample URL per page
     if ($new_count > 0) {
         log_msg("[PAGE $page_n] Sample: " . $all_urls[count($all_urls) - $new_count]);
     }
@@ -249,6 +201,7 @@ do {
     // Empty page detection
     if ($new_count === 0) {
         $consecutive_empty++;
+        log_msg("[PAGE $page_n] WARNING: empty page ($consecutive_empty consecutive)");
         if ($consecutive_empty >= 3) {
             log_msg("STOPPING: 3 consecutive empty pages");
             break;
@@ -259,36 +212,32 @@ do {
 
     $max_id = $next_max_id;
 
-    // Your original fast delay: 0.6-1.1s
+    // Original delay: 0.6-1.1s
     if ($more_available && $next_max_id) {
-        $delay_us = 600000 + mt_rand(0, 500000);
-        usleep($delay_us);
+        usleep(600000 + mt_rand(0, 500000));
     }
 
-    // Progress every 25 pages
+    // Progress log every 25 pages
     if ($page_n % 25 === 0) {
         $elapsed = round(microtime(true) - $start_time, 1);
         $rate = count($all_urls) > 0 ? round(count($all_urls) / ($elapsed / 60), 1) : 0;
         log_msg("──── PROGRESS: {$page_n} pages | " . count($all_urls) . " URLs | {$elapsed}s | ~{$rate}/min ────");
     }
 
-} while ($more_available && $next_max_id !== '');
+} while ($more_available && $next_max_id);
 
-// ── Done ──
-cleanup($cookie_jar);
-
+// ── Output ──
 $duration = round(microtime(true) - $start_time, 2);
 
-// Determine why we stopped
 $stop_reason = 'unknown';
-if (!$more_available && $next_max_id === '') $stop_reason = 'reached_end';
+if (!$more_available && empty($next_max_id)) $stop_reason = 'reached_end';
 elseif (!$more_available) $stop_reason = 'no_more_available';
-elseif ($next_max_id === '') $stop_reason = 'no_next_cursor';
+elseif (empty($next_max_id)) $stop_reason = 'no_next_cursor';
 elseif ($consecutive_empty >= 3) $stop_reason = 'empty_pages';
 elseif ($consecutive_fails >= 2) $stop_reason = 'request_failures';
 
 log_msg("============ DONE @$username ============");
-log_msg("URLs: " . count($all_urls) . " | Pages: $page_n | Time: {$duration}s | Retries: $total_retries | Rate limits: $rate_limit_hits | Stop: $stop_reason");
+log_msg("URLs=" . count($all_urls) . " | Pages=$page_n | Time={$duration}s | Retries=$total_retries | RateLimits=$rate_limit_hits | Stop=$stop_reason");
 log_msg("==========================================");
 
 $response = [
@@ -303,77 +252,87 @@ $response = [
 
 if ($debug) {
     $response['debug'] = [
-        'total_api_items' => $total_api_items,
         'unique_pks' => count($seen_pks),
         'total_retries' => $total_retries,
         'rate_limit_hits' => $rate_limit_hits,
-        'final_more_available' => $more_available,
-        'final_next_max_id' => $next_max_id,
+        'final_more_available' => $more_available ?? false,
+        'final_next_max_id' => $next_max_id ?? '',
     ];
 }
 
 echo json_encode($response, JSON_UNESCAPED_SLASHES);
-exit;
-
 
 // ============================================================
-// FUNCTIONS
+// FUNCTIONS — kept EXACTLY like the working version
 // ============================================================
 
+/**
+ * Log with timestamp and memory usage
+ */
 function log_msg(string $msg): void {
     $ts = date('H:i:s');
     $mem = round(memory_get_usage(true) / 1024 / 1024, 1);
     error_log("[ig][$ts][{$mem}M] $msg");
 }
 
-function fetch_url(string $url, array $headers = [], string $cookie_jar = ''): array {
+/**
+ * HTTP GET — SAME signature as working code: fetch_url($hostname, $path, $assoc_headers)
+ * This is the key: hostname and path are separate, headers are key=>value associative array.
+ */
+function fetch_url($hostname, $path, $extra_headers = []) {
     $ch = curl_init();
-    $opts = [
-        CURLOPT_URL => $url,
+    curl_setopt_array($ch, [
+        CURLOPT_URL => "https://$hostname$path",
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS => 5,
         CURLOPT_TIMEOUT => 30,
         CURLOPT_CONNECTTIMEOUT => 10,
-        CURLOPT_ENCODING => '',
-        CURLOPT_USERAGENT => 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36',
+        CURLOPT_USERAGENT => 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36',
         CURLOPT_HTTPHEADER => array_merge([
+            'Accept: application/json, text/html, */*',
             'Accept-Language: en-US,en;q=0.9',
-        ], $headers),
-        CURLOPT_SSL_VERIFYPEER => true,
-    ];
-        if ($cookie_jar !== '') {
-        $opts[CURLOPT_COOKIEJAR] = $cookie_jar;
-        $opts[CURLOPT_COOKIEFILE] = $cookie_jar;
-    }
-    curl_setopt_array($ch, $opts);
+            'Accept-Encoding: gzip, deflate, br',
+        ], array_map(
+            function($k, $v) { return "$k: $v"; },
+            array_keys($extra_headers),
+            $extra_headers
+        )),
+        CURLOPT_ENCODING => 'gzip, deflate, br',
+    ]);
 
     $body = curl_exec($ch);
     $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $error = curl_error($ch);
     $errno = curl_errno($ch);
-    $effective_url = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
     curl_close($ch);
 
     if ($errno !== 0) {
-        log_msg("cURL ERROR #$errno: $error | $url");
-        return ['status' => 0, 'body' => '', 'error' => $error];
+        log_msg("cURL ERROR #$errno: $error | https://$hostname$path");
+        return ['status' => 0, 'body' => ''];
     }
 
-    if ($effective_url !== $url) {
-        log_msg("REDIRECT: $url -> $effective_url");
+    if ($error) {
+        log_msg("cURL error: $error");
+        return ['status' => 0, 'body' => ''];
     }
 
-    return ['status' => $status, 'body' => ($body !== false ? $body : ''), 'error' => ''];
+    return ['status' => $status, 'body' => $body];
 }
 
-function pk_to_shortcode(string $pk): string {
+/**
+ * Convert PK to shortcode using bcmath for big integers.
+ * Falls back to GMP, then plain int.
+ */
+function pk_to_shortcode($pk) {
     $ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    $pk = (string)$pk;
 
     if ($pk === '' || $pk === '0') {
         return '';
     }
 
+    // bcmath — handles arbitrarily large integers
+        // bcmath — handles arbitrarily large integers
     if (function_exists('bcmod') && function_exists('bcdiv')) {
         $n = $pk;
         $code = '';
@@ -385,6 +344,7 @@ function pk_to_shortcode(string $pk): string {
         return $code;
     }
 
+    // GMP fallback
     if (function_exists('gmp_mod') && function_exists('gmp_div_q')) {
         $n = gmp_init($pk, 10);
         $code = '';
@@ -398,7 +358,8 @@ function pk_to_shortcode(string $pk): string {
         return $code;
     }
 
-    log_msg("WARNING: bcmath/gmp unavailable — shortcode may overflow");
+    // Plain int fallback (may overflow on large PKs)
+    log_msg("WARNING: bcmath/gmp unavailable — shortcode may be wrong for large PKs");
     $n = (int)$pk;
     $code = '';
     while ($n > 0) {
@@ -408,31 +369,32 @@ function pk_to_shortcode(string $pk): string {
     return $code;
 }
 
-function item_to_url(array $item): ?string {
-    // Prefer shortcode directly from API
-    $shortcode = (string)($item['code'] ?? '');
+/**
+ * Convert API item to Instagram URL.
+ * Prefers 'code' field from API (always correct), falls back to PK conversion.
+ */
+function item_to_url($item) {
+    // Instagram API returns shortcode directly in 'code' field
+    $sc = (string)($item['code'] ?? '');
 
-    if ($shortcode === '') {
-        $pk = (string)($item['pk'] ?? $item['id'] ?? '');
-        if ($pk === '') return null;
-        $shortcode = pk_to_shortcode($pk);
-        if ($shortcode === '') return null;
+    // Fallback: compute from PK
+    if ($sc === '') {
+        $pk = $item['pk'] ?? $item['id'] ?? '';
+        if (!$pk) {
+            return null;
+        }
+        $sc = pk_to_shortcode((string)$pk);
+        if ($sc === '') {
+            return null;
+        }
     }
 
-    $media_type = (int)($item['media_type'] ?? 1);
-    $product_type = (string)($item['product_type'] ?? '');
+    $media_type = $item['media_type'] ?? 1;
+    $product_type = $item['product_type'] ?? '';
 
-    if ($media_type === 2 || $product_type === 'clips' || $product_type === 'igtv') {
-        return "https://www.instagram.com/reel/$shortcode/";
+    if ($media_type == 2 || $product_type == 'clips' || $product_type == 'igtv') {
+        return "https://www.instagram.com/reel/$sc/";
     }
-
-    return "https://www.instagram.com/p/$shortcode/";
-}
-
-function cleanup(string $cookie_jar): void {
-    if ($cookie_jar !== '' && file_exists($cookie_jar)) {
-        @unlink($cookie_jar);
-        log_msg("Cookie jar cleaned up");
-    }
+    return "https://www.instagram.com/p/$sc/";
 }
 ?>
