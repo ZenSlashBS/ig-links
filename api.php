@@ -12,7 +12,11 @@ header('Access-Control-Allow-Methods: GET');
 header('Access-Control-Allow-Headers: Content-Type');
 
 $username = trim($_GET['username'] ?? '');
-$max_pages = (int)($_GET['max_pages'] ?? 50);
+$max_pages = (int)($_GET['max_pages'] ?? 500); // Increased for comprehensive scraping
+$delay_min = (int)($_GET['delay_min'] ?? 3);    // Min delay between requests (seconds)
+$delay_max = (int)($_GET['delay_max'] ?? 7);    // Max delay between requests (seconds)
+$max_total_time = (int)($_GET['max_time'] ?? 3600); // Max runtime 1hr default
+=======
 error_log("Fetching posts for @$username");
 
 $start_time = microtime(true);
@@ -26,7 +30,8 @@ $html = fetch_url("www.instagram.com", "/$username/", [
 ]);
 
 error_log("Profile HTML: status={$html['status']}, length=" . strlen($html['body']));
-error_log("Config: max_pages=$max_pages, delay=$delay_min-$delay_max");
+error_log("Config: max_pages=$max_pages, delay=$delay_min-$delay_max, max_time=$max_total_time");
+=======
 
 if ($html['status'] !== 200) {
     http_response_code($html['status']);
@@ -62,22 +67,48 @@ $seen_pks = [];
 $max_id = '';
 $page_n = 0;
 
+// Check total runtime limit before each page
 do {
+    if ((microtime(true) - $start_time) > $max_total_time) {
+        error_log("Hit max total time: " . round(microtime(true) - $start_time, 1) . "s");
+        break;
+    }
+    
     $page_n++;
-    $path = "/api/v1/feed/user/$user_id/?count=30";
+    if ($page_n > $max_pages) {
+        error_log("Hit max_pages limit: $max_pages");
+        break;
+    }
+    
+    $path = "/api/v1/feed/user/$user_id/?count=50"; // More posts per page
+=======
     if ($max_id) {
         $path .= '&max_id=' . urlencode($max_id);
     }
 
-    $resp = fetch_url("www.instagram.com", $path, [
-        'X-IG-App-ID' => '1217981644879628',
-        'Referer' => "https://www.instagram.com/$username/",
-        'Sec-Fetch-Dest' => 'empty',
-        'Sec-Fetch-Mode' => 'cors',
-        'Sec-Fetch-Site' => 'same-origin',
-    ]);
+    // Retry logic: up to 3 attempts with backoff
+    $retry = 0;
+    $max_retries = 3;
+    $resp = null;
+    do {
+        $resp = fetch_url("www.instagram.com", $path, [
+            'X-IG-App-ID' => '1217981644879628',
+            'Referer' => "https://www.instagram.com/$username/",
+            'Sec-Fetch-Dest' => 'empty',
+            'Sec-Fetch-Mode' => 'cors',
+            'Sec-Fetch-Site' => 'same-origin',
+        ]);
+        
+        if ($resp['status'] === 200) break;
+        
+        $retry++;
+        error_log("Page $page_n retry $retry/{$max_retries} failed (status={$resp['status']})");
+        if ($retry >= $max_retries) break;
+        sleep(5 * $retry); // Progressive backoff 5s,10s,15s
+    } while ($retry < $max_retries);
 
-    error_log("API page $page_n: status={$resp['status']}, body_length=" . strlen($resp['body']));
+    error_log("API page $page_n final: status={$resp['status']}, body_length=" . strlen($resp['body']));
+=======
 
     if ($resp['status'] !== 200) {
         error_log("Page $page_n HTTP {$resp['status']}");
@@ -123,9 +154,10 @@ do {
     $max_id = $next_max_id;
     $delay_us = ($delay_min * 1000000) + mt_rand(0, ($delay_max - $delay_min) * 1000000);
     usleep($delay_us);
-    error_log("Sleep page $page_n: " . round($delay_us / 1000000, 1) . "s");
+    error_log("Sleep after page $page_n: " . round($delay_us / 1000000, 1) . "s");
 
-} while ($more_available && $next_max_id);
+} while (($more_available && $next_max_id) || $page_n < 20); // Force at least 20 pages for complete scrape
+=======
 
 $end_time = microtime(true);
 $duration = round($end_time - $start_time, 2);
@@ -141,8 +173,12 @@ $response = [
     'config' => [
         'max_pages' => $max_pages,
         'delay_range' => "$delay_min-$delay_max",
-        'stopped_reason' => $page_n >= $max_pages ? 'max_pages' : ($more_available ? 'no_next_max_id' : 'no_more_available')
+        'max_total_time' => $max_total_time,
+        'stopped_reason' => $page_n >= $max_pages ? 'max_pages' : 
+                          ((microtime(true) - $start_time) > $max_total_time ? 'max_time' : 
+                          (!$more_available && !$next_max_id ? 'no_more_available' : 'min_pages_reached'))
     ]
+=======
 ];
 
 if ($debug) {
