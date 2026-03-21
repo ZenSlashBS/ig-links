@@ -30,17 +30,31 @@ $html = fetch_url("www.instagram.com", "/$username/", [
     'Upgrade-Insecure-Requests' => '1',
 ]);
 
+error_log("Profile HTML: status={$html['status']}, length=" . strlen($html['body']));
+
 if ($html['status'] !== 200) {
     http_response_code($html['status']);
     echo json_encode(['error' => "HTTP {$html['status']} fetching profile"]);
     exit;
 }
 
+$debug = isset($_GET['debug']) && $_GET['debug'];
+
 if (preg_match('/"user_id":"(\d+)"/', $html['body'], $matches)) {
     $user_id = $matches[1];
 } else {
-    http_response_code(404);
-    echo json_encode(['error' => 'Could not find user_id (private/deleted/geo-blocked?)']);
+    $error_details = [
+        'error' => 'Could not find user_id',
+        'html_length' => strlen($html['body']),
+        'html_preview' => substr($html['body'], 0, 1000),
+        'regex_test' => preg_match('/"user_id"/', $html['body']) ? 'user_id key found, no match' : 'user_id key missing'
+    ];
+    if ($debug) {
+        echo json_encode($error_details, JSON_PRETTY_PRINT);
+    } else {
+        http_response_code(404);
+        echo json_encode(['error' => 'Could not find user_id (private/deleted/geo-blocked?)']);
+    }
     exit;
 }
 
@@ -67,6 +81,8 @@ do {
         'Sec-Fetch-Site' => 'same-origin',
     ]);
 
+    error_log("API page $page_n: status={$resp['status']}, body_length=" . strlen($resp['body']));
+
     if ($resp['status'] !== 200) {
         error_log("Page $page_n HTTP {$resp['status']}");
         break;
@@ -80,7 +96,10 @@ do {
 
     $data = json_decode($body, true);
     if (json_last_error() !== JSON_ERROR_NONE) {
-        error_log("Page $page_n JSON decode error");
+        error_log("Page $page_n JSON decode error: " . json_last_error_msg());
+        if ($debug) {
+            echo json_encode(['error' => 'JSON decode fail', 'preview' => substr($body, 0, 500)], JSON_PRETTY_PRINT);
+        }
         break;
     }
 
@@ -118,8 +137,18 @@ error_log("Scraping complete: " . count($all_urls) . " urls in {$duration}s");
 $response = [
     'urls' => $all_urls,
     'count' => count($all_urls),
-    'took_seconds' => $duration
+    'took_seconds' => $duration,
+    'pages_fetched' => $page_n,
+    'user_id' => $user_id
 ];
+
+if ($debug) {
+    $response['debug'] = [
+        'final_more_available' => $more_available ?? false,
+        'final_next_max_id' => $next_max_id ?? '',
+        'total_requests' => $page_n
+    ];
+}
 
 echo json_encode($response, JSON_UNESCAPED_SLASHES);
 
