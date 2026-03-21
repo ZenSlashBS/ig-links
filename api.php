@@ -20,6 +20,8 @@ if (!isset($_GET['username']) || empty(trim($_GET['username']))) {
 $username = trim($_GET['username']);
 error_log("Fetching posts for @$username");
 
+$start_time = microtime(true);
+
 // Step 1: Get profile HTML -> user_id
 $html = fetch_url("www.instagram.com", "/$username/", [
     'Accept' => 'text/html,application/xhtml+xml,*/*',
@@ -52,7 +54,7 @@ $page_n = 0;
 
 do {
     $page_n++;
-    $path = "/api/v1/feed/user/$user_id/?count=12";
+    $path = "/api/v1/feed/user/$user_id/?count=24";
     if ($max_id) {
         $path .= '&max_id=' . urlencode($max_id);
     }
@@ -101,14 +103,25 @@ do {
         }
     }
 
-    error_log("Page $page_n +$new_count posts, total=" . count($all_urls) . ", more=$more_available");
+    error_log("Page $page_n +$new_count posts, total=" . count($all_urls) . ", more_available=$more_available, next_max_id=" . substr($next_max_id, 0, 20) . "...");
 
     $max_id = $next_max_id;
-    usleep((500000 + mt_rand(0, 400000))); // 0.5-0.9s delay
+    usleep((600000 + mt_rand(0, 500000))); // 0.6-1.1s delay - slower to avoid rate limit
 
-} while ($more_available && $max_id && $max_id !== $next_max_id);
+} while ($more_available && $next_max_id);
 
-echo json_encode($all_urls, JSON_UNESCAPED_SLASHES);
+$end_time = microtime(true);
+$duration = round($end_time - $start_time, 2);
+
+error_log("Scraping complete: " . count($all_urls) . " urls in {$duration}s");
+
+$response = [
+    'urls' => $all_urls,
+    'count' => count($all_urls),
+    'took_seconds' => $duration
+];
+
+echo json_encode($response, JSON_UNESCAPED_SLASHES);
 
 function fetch_url($hostname, $path, $extra_headers = []) {
     $ch = curl_init();
