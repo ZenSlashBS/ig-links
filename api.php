@@ -1,6 +1,6 @@
 <?php
 /**
- * get_posts.php -- PHP Instagram post URL scraper API.
+ * get_posts.php -- PHP Instagram post URL scraper API
  * VERSION: 2.3
  */
 
