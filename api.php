@@ -1,10 +1,15 @@
 <?php
 /**
- * get_posts.php -- PHP Instagram post URL scraper API
- * VERSION: 2.3
+ * get_posts.php -- PHP Instagram post URL scraper API.
+ * VERSION: 2.4
+ *
+ * Strategy:
+ *   1. Try v1 feed API (both app IDs)
+ *   2. If rate-limited mid-scrape, switch to GraphQL for remaining posts
+ *   3. If v1 never works, use GraphQL from the start
  */
 
-define('SCRIPT_VERSION', '2.3');
+define('SCRIPT_VERSION', '2.4');
 
 set_time_limit(0);
 ini_set('max_execution_time', 0);
@@ -75,16 +80,26 @@ if (!$user_id) {
     exit;
 }
 
-// ── Step 3: Test both App IDs ──
-log_msg("[STEP 3] Testing API endpoints...");
+// ── Step 3: Scrape using v1 API first, fallback to GraphQL ──
+log_msg("[STEP 3] Starting scrape for user_id=$user_id");
 
+$all_urls = [];
+$seen_pks = [];
+$page_n = 0;
+$total_retries = 0;
+$rate_limit_hits = 0;
+$method_used = 'v1_feed_api';
+$app_id_used = '';
+
+// --- Try v1 API with both app IDs ---
 $APP_IDS = [
     'mobile' => '1217981644879628',
     'web' => '936619743392459',
 ];
 
 $working_app_id = null;
-$test_data = null;
+$max_id = '';
+$more_available = false;
 
 foreach ($APP_IDS as $label => $app_id) {
     log_msg("[STEP 3] Testing $label app_id=$app_id");
@@ -98,242 +113,308 @@ foreach ($APP_IDS as $label => $app_id) {
     ]);
 
     log_msg("[STEP 3] $label: HTTP {$test_resp['status']} | " . strlen($test_resp['body']) . " bytes");
-    log_msg("[STEP 3] $label preview: " . substr($test_resp['body'], 0, 300));
 
     if ($test_resp['status'] === 200 && preg_match('/^\s*\{/', $test_resp['body'])) {
         $parsed = json_decode($test_resp['body'], true);
         if (json_last_error() === JSON_ERROR_NONE) {
-            $item_count = count($parsed['items'] ?? []);
-            $has_more = $parsed['more_available'] ?? false;
-            $has_next = !empty($parsed['next_max_id'] ?? '');
+            $items = $parsed['items'] ?? [];
+            $item_count = count($items);
+            $more_available = (bool)($parsed['more_available'] ?? false);
+            $max_id = (string)($parsed['next_max_id'] ?? '');
 
-            log_msg("[STEP 3] $label: items=$item_count more=" . ($has_more ? 'Y' : 'N') . " next=" . ($has_next ? 'Y' : 'N'));
+            log_msg("[STEP 3] $label: items=$item_count more=" . ($more_available ? 'Y' : 'N') . " next=" . ($max_id ? 'Y' : 'N'));
 
             if ($item_count > 0) {
                 $working_app_id = $app_id;
-                $test_data = $parsed;
-                log_msg("[STEP 3] WINNER: $label ($app_id)");
+                $app_id_used = $app_id;
+                $page_n = 1;
+
+                foreach ($items as $item) {
+                    $pk = (string)($item['pk'] ?? $item['id'] ?? '');
+                    if (!$pk || isset($seen_pks[$pk])) continue;
+                    $seen_pks[$pk] = true;
+                    $url = item_to_url($item);
+                    if ($url) $all_urls[] = $url;
+                }
+
+                log_msg("[PAGE 1] (test) +" . count($all_urls) . " | more=" . ($more_available ? 'Y' : 'N'));
+                if (count($all_urls) > 0) log_msg("[PAGE 1] Sample: " . $all_urls[0]);
                 break;
             }
         }
     }
-
     usleep(500000);
 }
 
-// GraphQL fallback
-if (!$working_app_id) {
-    log_msg("[STEP 3b] v1 API failed — trying GraphQL...");
-    $result = try_graphql($user_id, $username, $start_time, $debug);
-    if ($result !== null) {
-        echo json_encode($result, JSON_UNESCAPED_SLASHES);
-        exit;
+// --- Continue v1 API pagination ---
+$v1_failed = false;
+
+if ($working_app_id && $more_available && $max_id) {
+    log_msg("============ V1 PAGINATION (app_id=$working_app_id) ============");
+
+    while ($more_available && $max_id) {
+        $page_n++;
+        $path = "/api/v1/feed/user/$user_id/?count=12&max_id=" . urlencode($max_id);
+
+        log_msg("[PAGE $page_n] GET max_id=" . substr($max_id, 0, 20) . "...");
+
+        $resp = null;
+        $page_ok = false;
+
+        for ($retry = 0; $retry < 4; $retry++) {
+            if ($retry > 0) {
+                $wait = min(10 * pow(2, $retry - 1), 60) + mt_rand(1, 5);
+                $total_retries++;
+                log_msg("[PAGE $page_n] RETRY $retry/4 — wait {$wait}s");
+                sleep($wait);
+            }
+
+            $req_start = microtime(true);
+            $resp = fetch_url("www.instagram.com", $path, [
+                'X-IG-App-ID' => $working_app_id,
+                'Referer' => "https://www.instagram.com/$username/",
+                'Sec-Fetch-Dest' => 'empty',
+                'Sec-Fetch-Mode' => 'cors',
+                'Sec-Fetch-Site' => 'same-origin',
+            ]);
+            $req_time = round(microtime(true) - $req_start, 2);
+
+            log_msg("[PAGE $page_n] Attempt " . ($retry + 1) . ": HTTP {$resp['status']} | " . strlen($resp['body']) . " bytes | {$req_time}s");
+
+            // Log the actual error response so we can see what's happening
+            if ($resp['status'] !== 200) {
+                log_msg("[PAGE $page_n] ERROR BODY: " . substr($resp['body'], 0, 500));
+            }
+
+            if ($resp['status'] === 200) {
+                $page_ok = true;
+                break;
+            }
+
+            if (in_array($resp['status'], [429, 401, 403])) {
+                $rate_limit_hits++;
+                log_msg("[PAGE $page_n] RATE LIMITED ({$resp['status']}) — hit #$rate_limit_hits");
+            }
+        }
+
+        if (!$page_ok) {
+            log_msg("[PAGE $page_n] V1 API FAILED — switching to GraphQL for remaining posts");
+            $v1_failed = true;
+            break;
+        }
+
+        $body = $resp['body'];
+        if (!preg_match('/^\s*\{/', $body)) {
+            log_msg("[PAGE $page_n] NOT JSON — switching to GraphQL");
+            $v1_failed = true;
+            break;
+        }
+
+        $data = json_decode($body, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            log_msg("[PAGE $page_n] JSON ERROR — switching to GraphQL");
+            $v1_failed = true;
+            break;
+        }
+
+        $items = $data['items'] ?? [];
+        $more_available = (bool)($data['more_available'] ?? false);
+        $next_max_id = (string)($data['next_max_id'] ?? '');
+
+        $new_count = 0;
+        foreach ($items as $item) {
+            $pk = (string)($item['pk'] ?? $item['id'] ?? '');
+            if (!$pk || isset($seen_pks[$pk])) continue;
+            $seen_pks[$pk] = true;
+            $url = item_to_url($item);
+            if ($url) {
+                $all_urls[] = $url;
+                $new_count++;
+            }
+        }
+
+        log_msg("[PAGE $page_n] +$new_count new | total=" . count($all_urls) . " | more=" . ($more_available ? 'Y' : 'N') . " | next=" . ($next_max_id ? substr($next_max_id, 0, 20) . '...' : 'NONE'));
+        if ($new_count > 0) log_msg("[PAGE $page_n] Sample: " . $all_urls[count($all_urls) - $new_count]);
+
+        $max_id = $next_max_id;
+
+        if ($more_available && $max_id) {
+            $delay = ($rate_limit_hits > 0) ? 2000000 + mt_rand(0, 2000000) : 600000 + mt_rand(0, 500000);
+            usleep($delay);
+        }
+
+        if ($page_n % 25 === 0) {
+            $elapsed = round(microtime(true) - $start_time, 1);
+            log_msg("──── PROGRESS: $page_n pages | " . count($all_urls) . " URLs | {$elapsed}s ────");
+        }
+    }
+}
+
+// --- GraphQL fallback: either v1 never worked, or it got rate-limited mid-scrape ---
+$need_graphql = (!$working_app_id) || ($v1_failed && $more_available);
+
+if ($need_graphql) {
+    log_msg("============ GRAPHQL FALLBACK ============");
+    log_msg("[GQL] Already have " . count($all_urls) . " URLs from v1 API");
+    log_msg("[GQL] Will fetch ALL posts via GraphQL and merge (deduplicating)");
+
+    if ($v1_failed) {
+        $method_used = 'v1_then_graphql';
+    } else {
+        $method_used = 'graphql';
     }
 
-    log_msg("[STEP 3b] ALL METHODS FAILED");
-    echo json_encode([
-        'error' => 'Could not fetch posts — all API methods failed',
-        'user_id' => $user_id,
-        'version' => SCRIPT_VERSION,
+    // Wait before switching to GraphQL to let rate limit cool down
+    if ($rate_limit_hits > 0) {
+        $cooldown = 15 + mt_rand(0, 10);
+        log_msg("[GQL] Cooling down {$cooldown}s before GraphQL...");
+        sleep($cooldown);
+    }
+
+    // Re-fetch profile page to get fresh session
+    log_msg("[GQL] Refreshing session...");
+    $refresh = fetch_url("www.instagram.com", "/$username/", [
+        'Accept' => 'text/html,application/xhtml+xml,*/*',
+        'Sec-Fetch-Dest' => 'document',
+        'Sec-Fetch-Mode' => 'navigate',
     ]);
-    exit;
-}
+    log_msg("[GQL] Session refresh: HTTP {$refresh['status']}");
+    sleep(2);
 
-// ── Step 4: Paginate ──
-log_msg("============ PAGINATING (app_id=$working_app_id) ============");
+    $graphql_hash = '69cba40317214236af40e7efa697781d';
+    $has_next = true;
+    $end_cursor = '';
+    $gql_page = 0;
+    $consecutive_gql_fails = 0;
 
-$all_urls = [];
-$seen_pks = [];
-$max_id = '';
-$page_n = 0;
-$more_available = false;
-$next_max_id = '';
-$consecutive_empty = 0;
-$total_retries = 0;
-$rate_limit_hits = 0;
+    while ($has_next) {
+        $gql_page++;
+        $page_n++;
 
-// Process test page
-if ($test_data) {
-    $page_n = 1;
-    $items = $test_data['items'] ?? [];
-    $more_available = (bool)($test_data['more_available'] ?? false);
-    $next_max_id = (string)($test_data['next_max_id'] ?? '');
+        $vars = ['id' => $user_id, 'first' => 12];
+        if ($end_cursor) $vars['after'] = $end_cursor;
 
-    $new_count = 0;
-    foreach ($items as $item) {
-        $pk = (string)($item['pk'] ?? $item['id'] ?? '');
-        if (!$pk || isset($seen_pks[$pk])) continue;
-        $seen_pks[$pk] = true;
-        $url = item_to_url($item);
-        if ($url) {
-            $all_urls[] = $url;
-            $new_count++;
-        }
-    }
+        $gql_path = "/graphql/query/?query_hash=$graphql_hash&variables=" . urlencode(json_encode($vars));
 
-    $max_id = $next_max_id;
-    log_msg("[PAGE 1] (test) +$new_count | total=" . count($all_urls) . " | more=" . ($more_available ? 'Y' : 'N') . " | next=" . ($next_max_id ? substr($next_max_id, 0, 20) . '...' : 'NONE'));
+        log_msg("[GQL PAGE $gql_page] GET cursor=" . ($end_cursor ? substr($end_cursor, 0, 20) . '...' : '(first)'));
 
-    if ($new_count > 0) {
-        log_msg("[PAGE 1] Sample: " . $all_urls[0]);
-    }
-}
+        // Retry for GraphQL too
+        $gr = null;
+        $gql_ok = false;
 
-// Continue paginating
-while ($more_available && $max_id) {
-    $page_n++;
+        for ($retry = 0; $retry < 4; $retry++) {
+            if ($retry > 0) {
+                $wait = min(10 * pow(2, $retry - 1), 60) + mt_rand(1, 5);
+                $total_retries++;
+                log_msg("[GQL PAGE $gql_page] RETRY $retry/4 — wait {$wait}s");
+                sleep($wait);
+            }
 
-    $path = "/api/v1/feed/user/$user_id/?count=12&max_id=" . urlencode($max_id);
+            $req_start = microtime(true);
+            $gr = fetch_url("www.instagram.com", $gql_path, [
+                'X-IG-App-ID' => '936619743392459',
+                'X-Requested-With' => 'XMLHttpRequest',
+                'Referer' => "https://www.instagram.com/$username/",
+                'Sec-Fetch-Dest' => 'empty',
+                'Sec-Fetch-Mode' => 'cors',
+                'Sec-Fetch-Site' => 'same-origin',
+            ]);
+            $req_time = round(microtime(true) - $req_start, 2);
 
-    log_msg("[PAGE $page_n] GET max_id=" . substr($max_id, 0, 20) . "...");
+                        log_msg("[GQL PAGE $gql_page] Attempt " . ($retry + 1) . ": HTTP {$gr['status']} | " . strlen($gr['body']) . " bytes | {$req_time}s");
 
-    // Smart retry: up to 6 attempts with increasing backoff for rate limits
-    $resp = null;
-    $page_ok = false;
-    $max_retries = 6;
+            if ($gr['status'] !== 200) {
+                log_msg("[GQL PAGE $gql_page] ERROR BODY: " . substr($gr['body'], 0, 500));
+                if (in_array($gr['status'], [429, 401, 403])) {
+                    $rate_limit_hits++;
+                    log_msg("[GQL PAGE $gql_page] RATE LIMITED — hit #$rate_limit_hits");
+                }
+                continue;
+            }
 
-    for ($retry = 0; $retry < $max_retries; $retry++) {
-        if ($retry > 0) {
-            // Exponential-ish backoff: 5s, 15s, 30s, 60s, 120s
-            $wait = min(5 * pow(2, $retry), 120) + mt_rand(1, 10);
-            $total_retries++;
-            log_msg("[PAGE $page_n] RETRY $retry/$max_retries — backoff {$wait}s (total retries: $total_retries)");
-            sleep($wait);
-        }
-
-        $req_start = microtime(true);
-
-        $resp = fetch_url("www.instagram.com", $path, [
-            'X-IG-App-ID' => $working_app_id,
-            'Referer' => "https://www.instagram.com/$username/",
-            'Sec-Fetch-Dest' => 'empty',
-            'Sec-Fetch-Mode' => 'cors',
-            'Sec-Fetch-Site' => 'same-origin',
-        ]);
-
-        $req_time = round(microtime(true) - $req_start, 2);
-        log_msg("[PAGE $page_n] Attempt " . ($retry + 1) . ": HTTP {$resp['status']} | " . strlen($resp['body']) . " bytes | {$req_time}s");
-
-        if ($resp['status'] === 200) {
-            $page_ok = true;
+            $gql_ok = true;
             break;
         }
 
-        // Rate limit — worth retrying with longer wait
-        if (in_array($resp['status'], [429, 401, 403])) {
-            $rate_limit_hits++;
-            log_msg("[PAGE $page_n] RATE LIMITED ({$resp['status']}) — hit #$rate_limit_hits — will retry with backoff");
-            continue; // let the backoff loop handle it
-        }
-
-        // Other errors (500, 0, etc) — retry a couple times then give up
-        if ($retry >= 2) {
-            log_msg("[PAGE $page_n] Non-rate-limit error after 3 attempts — stopping");
-            break;
-        }
-    }
-
-    if (!$page_ok) {
-        log_msg("[PAGE $page_n] FAILED after $max_retries attempts — trying to continue...");
-
-        // Instead of stopping immediately, skip this cursor and try to recover
-        // by fetching the profile page again to reset cookies/session
-        log_msg("[PAGE $page_n] Refreshing session...");
-        $refresh = fetch_url("www.instagram.com", "/$username/", [
-            'Accept' => 'text/html,application/xhtml+xml,*/*',
-            'Sec-Fetch-Dest' => 'document',
-            'Sec-Fetch-Mode' => 'navigate',
-        ]);
-        log_msg("[PAGE $page_n] Session refresh: HTTP {$refresh['status']}");
-        sleep(10 + mt_rand(0, 5));
-
-        // One more try after session refresh
-        $resp = fetch_url("www.instagram.com", $path, [
-            'X-IG-App-ID' => $working_app_id,
-            'Referer' => "https://www.instagram.com/$username/",
-            'Sec-Fetch-Dest' => 'empty',
-            'Sec-Fetch-Mode' => 'cors',
-            'Sec-Fetch-Site' => 'same-origin',
-        ]);
-
-        log_msg("[PAGE $page_n] Post-refresh attempt: HTTP {$resp['status']} | " . strlen($resp['body']) . " bytes");
-
-        if ($resp['status'] !== 200) {
-            log_msg("[PAGE $page_n] Still failing after session refresh — stopping pagination");
-            break;
-        }
-
-        $page_ok = true;
-    }
-
-    // Parse JSON
-    $body = $resp['body'];
-    if (!preg_match('/^\s*\{/', $body)) {
-        log_msg("[PAGE $page_n] NOT JSON — stopping");
-        break;
-    }
-
-    $data = json_decode($body, true);
-    if (json_last_error() !== JSON_ERROR_NONE) {
-        log_msg("[PAGE $page_n] JSON ERROR: " . json_last_error_msg());
-        break;
-    }
-
-    $items = $data['items'] ?? [];
-    $more_available = (bool)($data['more_available'] ?? false);
-    $next_max_id = (string)($data['next_max_id'] ?? '');
-
-    $new_count = 0;
-    $dupes = 0;
-    foreach ($items as $item) {
-        $pk = (string)($item['pk'] ?? $item['id'] ?? '');
-        if (!$pk || isset($seen_pks[$pk])) {
-            $dupes++;
+        if (!$gql_ok) {
+            $consecutive_gql_fails++;
+            log_msg("[GQL PAGE $gql_page] FAILED after retries (consecutive=$consecutive_gql_fails)");
+            if ($consecutive_gql_fails >= 2) {
+                log_msg("[GQL] STOPPING: 2 consecutive failures");
+                break;
+            }
+            sleep(30 + mt_rand(0, 15));
             continue;
         }
-        $seen_pks[$pk] = true;
-        $url = item_to_url($item);
-        if ($url) {
-            $all_urls[] = $url;
-            $new_count++;
-        }
-    }
 
-    log_msg("[PAGE $page_n] +$new_count new | $dupes dupes | total=" . count($all_urls) . " | more=" . ($more_available ? 'Y' : 'N') . " | next=" . ($next_max_id ? substr($next_max_id, 0, 20) . '...' : 'NONE'));
+        $consecutive_gql_fails = 0;
 
-    if ($new_count > 0) {
-        log_msg("[PAGE $page_n] Sample: " . $all_urls[count($all_urls) - $new_count]);
-    }
-
-    if ($new_count === 0) {
-        $consecutive_empty++;
-        if ($consecutive_empty >= 3) {
-            log_msg("STOPPING: 3 consecutive empty pages");
+        $gd = json_decode($gr['body'], true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            log_msg("[GQL PAGE $gql_page] JSON ERROR: " . json_last_error_msg());
             break;
         }
-    } else {
-        $consecutive_empty = 0;
-    }
 
-    $max_id = $next_max_id;
-
-    // Adaptive delay: slow down if we've been rate limited
-    if ($more_available && $max_id) {
-        if ($rate_limit_hits > 0) {
-            // Been rate limited before — use slower delay: 2-4s
-            $delay_us = 2000000 + mt_rand(0, 2000000);
-            log_msg("[PAGE $page_n] Using slow delay (rate limited before): " . round($delay_us / 1000000, 1) . "s");
-        } else {
-            // No rate limits yet — use original fast delay: 0.6-1.1s
-            $delay_us = 600000 + mt_rand(0, 500000);
+        $md = $gd['data']['user']['edge_owner_to_timeline_media'] ?? null;
+        if (!$md) {
+            log_msg("[GQL PAGE $gql_page] No media data in response");
+            log_msg("[GQL PAGE $gql_page] Response keys: " . implode(', ', array_keys($gd)));
+            break;
         }
-        usleep($delay_us);
-    }
 
-    if ($page_n % 25 === 0) {
-        $elapsed = round(microtime(true) - $start_time, 1);
-        $rate = count($all_urls) > 0 ? round(count($all_urls) / ($elapsed / 60), 1) : 0;
-        log_msg("──── PROGRESS: $page_n pages | " . count($all_urls) . " URLs | {$elapsed}s | ~{$rate}/min | rate_limits=$rate_limit_hits ────");
+        $gedges = $md['edges'] ?? [];
+        $has_next = (bool)($md['page_info']['has_next_page'] ?? false);
+        $end_cursor = (string)($md['page_info']['end_cursor'] ?? '');
+
+        $nc = 0;
+        $dupes = 0;
+        foreach ($gedges as $ge) {
+            $gn = $ge['node'] ?? [];
+            $gsc = $gn['shortcode'] ?? '';
+            if (!$gsc) continue;
+
+            // Deduplicate against v1 results using shortcode
+            if (isset($seen_pks[$gsc])) {
+                $dupes++;
+                continue;
+            }
+            $seen_pks[$gsc] = true;
+
+            // Also deduplicate by pk if present
+            $gpk = (string)($gn['id'] ?? '');
+            if ($gpk && isset($seen_pks[$gpk])) {
+                $dupes++;
+                continue;
+            }
+            if ($gpk) $seen_pks[$gpk] = true;
+
+            $gvid = $gn['is_video'] ?? false;
+            $all_urls[] = $gvid
+                ? "https://www.instagram.com/reel/$gsc/"
+                : "https://www.instagram.com/p/$gsc/";
+            $nc++;
+        }
+
+        log_msg("[GQL PAGE $gql_page] +$nc new | $dupes dupes | total=" . count($all_urls) . " | more=" . ($has_next ? 'Y' : 'N') . " | cursor=" . ($end_cursor ? substr($end_cursor, 0, 20) . '...' : 'NONE'));
+
+        if ($nc > 0) {
+            log_msg("[GQL PAGE $gql_page] Sample: " . $all_urls[count($all_urls) - $nc]);
+        }
+
+        if ($nc === 0 && $dupes === 0) {
+            log_msg("[GQL PAGE $gql_page] No items at all — stopping");
+            break;
+        }
+
+        if ($has_next && $end_cursor) {
+            $delay = ($rate_limit_hits > 0) ? 2000000 + mt_rand(0, 2000000) : 600000 + mt_rand(0, 500000);
+            usleep($delay);
+        }
+
+        if ($gql_page % 25 === 0) {
+            $elapsed = round(microtime(true) - $start_time, 1);
+            log_msg("──── GQL PROGRESS: $gql_page pages | " . count($all_urls) . " URLs | {$elapsed}s ────");
+        }
     }
 }
 
@@ -341,13 +422,14 @@ while ($more_available && $max_id) {
 $duration = round(microtime(true) - $start_time, 2);
 
 $stop_reason = 'unknown';
-if (!$more_available && empty($max_id)) $stop_reason = 'reached_end';
-elseif (!$more_available) $stop_reason = 'no_more_available';
-elseif (empty($max_id)) $stop_reason = 'no_next_cursor';
-elseif ($consecutive_empty >= 3) $stop_reason = 'empty_pages';
+if (!$more_available && !($has_next ?? false)) $stop_reason = 'reached_end';
+elseif (!($has_next ?? true)) $stop_reason = 'reached_end';
+elseif (!$more_available && !$v1_failed) $stop_reason = 'no_more_available';
+elseif (($consecutive_gql_fails ?? 0) >= 2) $stop_reason = 'graphql_failures';
+elseif ($v1_failed && !$need_graphql) $stop_reason = 'v1_rate_limited';
 
 log_msg("============ DONE @$username v" . SCRIPT_VERSION . " ============");
-log_msg("URLs=" . count($all_urls) . " | Pages=$page_n | Time={$duration}s | Retries=$total_retries | RateLimits=$rate_limit_hits | Stop=$stop_reason");
+log_msg("URLs=" . count($all_urls) . " | Pages=$page_n | Time={$duration}s | Retries=$total_retries | RateLimits=$rate_limit_hits | Method=$method_used | Stop=$stop_reason");
 
 $response = [
     'username' => $username,
@@ -356,8 +438,10 @@ $response = [
     'pages_fetched' => $page_n,
     'duration_seconds' => $duration,
     'stop_reason' => $stop_reason,
-    'method' => 'v1_feed_api',
-    'app_id_used' => $working_app_id,
+    'method' => $method_used,
+    'app_id_used' => $app_id_used,
+    'rate_limit_hits' => $rate_limit_hits,
+    'total_retries' => $total_retries,
     'version' => SCRIPT_VERSION,
     'urls' => $all_urls,
 ];
@@ -365,10 +449,8 @@ $response = [
 if ($debug) {
     $response['debug'] = [
         'unique_pks' => count($seen_pks),
-        'total_retries' => $total_retries,
-        'rate_limit_hits' => $rate_limit_hits,
-        'final_more_available' => $more_available,
-        'final_next_max_id' => $next_max_id ?? '',
+        'v1_failed_mid_scrape' => $v1_failed ?? false,
+        'graphql_used' => $need_graphql ?? false,
     ];
 }
 
@@ -419,126 +501,6 @@ function fetch_url($hostname, $path, $extra_headers = []) {
     }
 
     return ['status' => $status, 'body' => ($body !== false ? $body : '')];
-}
-
-function try_graphql($user_id, $username, $start_time, $debug) {
-    log_msg("[GQL] Trying GraphQL endpoint...");
-
-    $graphql_hash = '69cba40317214236af40e7efa697781d';
-    $variables = json_encode(['id' => $user_id, 'first' => 12]);
-    $gql_path = "/graphql/query/?query_hash=$graphql_hash&variables=" . urlencode($variables);
-
-    $gql_resp = fetch_url("www.instagram.com", $gql_path, [
-        'X-IG-App-ID' => '936619743392459',
-        'X-Requested-With' => 'XMLHttpRequest',
-        'Referer' => "https://www.instagram.com/$username/",
-        'Sec-Fetch-Dest' => 'empty',
-        'Sec-Fetch-Mode' => 'cors',
-        'Sec-Fetch-Site' => 'same-origin',
-    ]);
-
-    log_msg("[GQL] HTTP {$gql_resp['status']} | " . strlen($gql_resp['body']) . " bytes");
-    log_msg("[GQL] Preview: " . substr($gql_resp['body'], 0, 300));
-
-    if ($gql_resp['status'] !== 200) {
-        return null;
-    }
-
-    $gql_data = json_decode($gql_resp['body'], true);
-    if (json_last_error() !== JSON_ERROR_NONE) {
-        return null;
-    }
-
-    $media_data = $gql_data['data']['user']['edge_owner_to_timeline_media'] ?? null;
-    if (!$media_data) {
-        return null;
-    }
-
-    $edges = $media_data['edges'] ?? [];
-    if (count($edges) === 0) {
-        return null;
-    }
-
-    log_msg("[GQL] First page: " . count($edges) . " edges");
-
-    $all_urls = [];
-    $seen = [];
-    $page_n = 0;
-    $has_next = $media_data['page_info']['has_next_page'] ?? false;
-    $end_cursor = $media_data['page_info']['end_cursor'] ?? '';
-
-    foreach ($edges as $edge) {
-        $node = $edge['node'] ?? [];
-        $sc = $node['shortcode'] ?? '';
-        if (!$sc || isset($seen[$sc])) continue;
-        $seen[$sc] = true;
-        $is_video = $node['is_video'] ?? false;
-        $all_urls[] = $is_video
-            ? "https://www.instagram.com/reel/$sc/"
-            : "https://www.instagram.com/p/$sc/";
-    }
-    $page_n = 1;
-    log_msg("[GQL PAGE 1] +" . count($all_urls) . " URLs | more=" . ($has_next ? 'Y' : 'N'));
-
-    while ($has_next && $end_cursor) {
-        $page_n++;
-        usleep(600000 + mt_rand(0, 500000));
-
-        $vars = json_encode(['id' => $user_id, 'first' => 12, 'after' => $end_cursor]);
-        $gpath = "/graphql/query/?query_hash=$graphql_hash&variables=" . urlencode($vars);
-
-        $gr = fetch_url("www.instagram.com", $gpath, [
-            'X-IG-App-ID' => '936619743392459',
-            'X-Requested-With' => 'XMLHttpRequest',
-            'Referer' => "https://www.instagram.com/$username/",
-            'Sec-Fetch-Dest' => 'empty',
-            'Sec-Fetch-Mode' => 'cors',
-            'Sec-Fetch-Site' => 'same-origin',
-        ]);
-
-        log_msg("[GQL PAGE $page_n] HTTP {$gr['status']} | " . strlen($gr['body']) . " bytes");
-
-        if ($gr['status'] !== 200) break;
-
-        $gd = json_decode($gr['body'], true);
-        if (json_last_error() !== JSON_ERROR_NONE) break;
-
-        $md = $gd['data']['user']['edge_owner_to_timeline_media'] ?? [];
-        $gedges = $md['edges'] ?? [];
-        $has_next = $md['page_info']['has_next_page'] ?? false;
-        $end_cursor = $md['page_info']['end_cursor'] ?? '';
-
-        $nc = 0;
-        foreach ($gedges as $ge) {
-            $gn = $ge['node'] ?? [];
-            $gsc = $gn['shortcode'] ?? '';
-            if (!$gsc || isset($seen[$gsc])) continue;
-            $seen[$gsc] = true;
-            $gvid = $gn['is_video'] ?? false;
-            $all_urls[] = $gvid
-                ? "https://www.instagram.com/reel/$gsc/"
-                : "https://www.instagram.com/p/$gsc/";
-            $nc++;
-        }
-
-        log_msg("[GQL PAGE $page_n] +$nc new | total=" . count($all_urls) . " | more=" . ($has_next ? 'Y' : 'N'));
-        if ($nc === 0) break;
-    }
-
-    $duration = round(microtime(true) - $start_time, 2);
-    log_msg("[GQL] DONE: " . count($all_urls) . " URLs in {$duration}s");
-
-    return [
-        'username' => $username,
-        'user_id' => $user_id,
-        'count' => count($all_urls),
-        'pages_fetched' => $page_n,
-        'duration_seconds' => $duration,
-        'stop_reason' => $has_next ? 'error' : 'reached_end',
-        'method' => 'graphql',
-        'version' => SCRIPT_VERSION,
-        'urls' => $all_urls,
-    ];
 }
 
 function pk_to_shortcode($pk) {
@@ -595,5 +557,5 @@ function item_to_url($item) {
     return "https://www.instagram.com/p/$sc/";
 }
 
-// VERSION: 2.3
+// VERSION: 2.4
 ?>
