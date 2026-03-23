@@ -1,10 +1,10 @@
 <?php
 /**
  * get_posts.php -- PHP Instagram post URL scraper API.
- * VERSION: 2.2
+ * VERSION: 2.3
  */
 
-define('SCRIPT_VERSION', '2.2');
+define('SCRIPT_VERSION', '2.3');
 
 set_time_limit(0);
 ini_set('max_execution_time', 0);
@@ -75,7 +75,7 @@ if (!$user_id) {
     exit;
 }
 
-// ── Step 3: Test both App IDs to find which works ──
+// ── Step 3: Test both App IDs ──
 log_msg("[STEP 3] Testing API endpoints...");
 
 $APP_IDS = [
@@ -121,7 +121,7 @@ foreach ($APP_IDS as $label => $app_id) {
     usleep(500000);
 }
 
-// ── Step 3b: GraphQL fallback ──
+// GraphQL fallback
 if (!$working_app_id) {
     log_msg("[STEP 3b] v1 API failed — trying GraphQL...");
     $result = try_graphql($user_id, $username, $start_time, $debug);
@@ -139,7 +139,7 @@ if (!$working_app_id) {
     exit;
 }
 
-// ── Step 4: Paginate using working App ID ──
+// ── Step 4: Paginate ──
 log_msg("============ PAGINATING (app_id=$working_app_id) ============");
 
 $all_urls = [];
@@ -149,11 +149,10 @@ $page_n = 0;
 $more_available = false;
 $next_max_id = '';
 $consecutive_empty = 0;
-$consecutive_fails = 0;
 $total_retries = 0;
 $rate_limit_hits = 0;
 
-// Process the test page we already fetched
+// Process test page
 if ($test_data) {
     $page_n = 1;
     $items = $test_data['items'] ?? [];
@@ -188,14 +187,17 @@ while ($more_available && $max_id) {
 
     log_msg("[PAGE $page_n] GET max_id=" . substr($max_id, 0, 20) . "...");
 
+    // Smart retry: up to 6 attempts with increasing backoff for rate limits
     $resp = null;
     $page_ok = false;
+    $max_retries = 6;
 
-    for ($retry = 0; $retry < 3; $retry++) {
+    for ($retry = 0; $retry < $max_retries; $retry++) {
         if ($retry > 0) {
-            $wait = 3 * $retry + mt_rand(1, 3);
+            // Exponential-ish backoff: 5s, 15s, 30s, 60s, 120s
+            $wait = min(5 * pow(2, $retry), 120) + mt_rand(1, 10);
             $total_retries++;
-            log_msg("[PAGE $page_n] RETRY $retry/3 — wait {$wait}s");
+            log_msg("[PAGE $page_n] RETRY $retry/$max_retries — backoff {$wait}s (total retries: $total_retries)");
             sleep($wait);
         }
 
@@ -210,31 +212,61 @@ while ($more_available && $max_id) {
         ]);
 
         $req_time = round(microtime(true) - $req_start, 2);
-        log_msg("[PAGE $page_n] HTTP {$resp['status']} | " . strlen($resp['body']) . " bytes | {$req_time}s");
+        log_msg("[PAGE $page_n] Attempt " . ($retry + 1) . ": HTTP {$resp['status']} | " . strlen($resp['body']) . " bytes | {$req_time}s");
 
         if ($resp['status'] === 200) {
             $page_ok = true;
-            $consecutive_fails = 0;
             break;
         }
 
+        // Rate limit — worth retrying with longer wait
         if (in_array($resp['status'], [429, 401, 403])) {
             $rate_limit_hits++;
-            log_msg("[PAGE $page_n] RATE LIMITED ({$resp['status']}) — total: $rate_limit_hits");
+            log_msg("[PAGE $page_n] RATE LIMITED ({$resp['status']}) — hit #$rate_limit_hits — will retry with backoff");
+            continue; // let the backoff loop handle it
+        }
+
+        // Other errors (500, 0, etc) — retry a couple times then give up
+        if ($retry >= 2) {
+            log_msg("[PAGE $page_n] Non-rate-limit error after 3 attempts — stopping");
+            break;
         }
     }
 
     if (!$page_ok) {
-        $consecutive_fails++;
-        log_msg("[PAGE $page_n] FAILED (consecutive=$consecutive_fails)");
-        if ($consecutive_fails >= 2) {
-            log_msg("STOPPING: 2 consecutive failures");
+        log_msg("[PAGE $page_n] FAILED after $max_retries attempts — trying to continue...");
+
+        // Instead of stopping immediately, skip this cursor and try to recover
+        // by fetching the profile page again to reset cookies/session
+        log_msg("[PAGE $page_n] Refreshing session...");
+        $refresh = fetch_url("www.instagram.com", "/$username/", [
+            'Accept' => 'text/html,application/xhtml+xml,*/*',
+            'Sec-Fetch-Dest' => 'document',
+            'Sec-Fetch-Mode' => 'navigate',
+        ]);
+        log_msg("[PAGE $page_n] Session refresh: HTTP {$refresh['status']}");
+        sleep(10 + mt_rand(0, 5));
+
+        // One more try after session refresh
+        $resp = fetch_url("www.instagram.com", $path, [
+            'X-IG-App-ID' => $working_app_id,
+            'Referer' => "https://www.instagram.com/$username/",
+            'Sec-Fetch-Dest' => 'empty',
+            'Sec-Fetch-Mode' => 'cors',
+            'Sec-Fetch-Site' => 'same-origin',
+        ]);
+
+        log_msg("[PAGE $page_n] Post-refresh attempt: HTTP {$resp['status']} | " . strlen($resp['body']) . " bytes");
+
+        if ($resp['status'] !== 200) {
+            log_msg("[PAGE $page_n] Still failing after session refresh — stopping pagination");
             break;
         }
-        sleep(5);
-        continue;
+
+        $page_ok = true;
     }
 
+    // Parse JSON
     $body = $resp['body'];
     if (!preg_match('/^\s*\{/', $body)) {
         log_msg("[PAGE $page_n] NOT JSON — stopping");
@@ -285,14 +317,23 @@ while ($more_available && $max_id) {
 
     $max_id = $next_max_id;
 
+    // Adaptive delay: slow down if we've been rate limited
     if ($more_available && $max_id) {
-        usleep(600000 + mt_rand(0, 500000));
+        if ($rate_limit_hits > 0) {
+            // Been rate limited before — use slower delay: 2-4s
+            $delay_us = 2000000 + mt_rand(0, 2000000);
+            log_msg("[PAGE $page_n] Using slow delay (rate limited before): " . round($delay_us / 1000000, 1) . "s");
+        } else {
+            // No rate limits yet — use original fast delay: 0.6-1.1s
+            $delay_us = 600000 + mt_rand(0, 500000);
+        }
+        usleep($delay_us);
     }
 
     if ($page_n % 25 === 0) {
         $elapsed = round(microtime(true) - $start_time, 1);
         $rate = count($all_urls) > 0 ? round(count($all_urls) / ($elapsed / 60), 1) : 0;
-        log_msg("──── PROGRESS: $page_n pages | " . count($all_urls) . " URLs | {$elapsed}s | ~{$rate}/min ────");
+        log_msg("──── PROGRESS: $page_n pages | " . count($all_urls) . " URLs | {$elapsed}s | ~{$rate}/min | rate_limits=$rate_limit_hits ────");
     }
 }
 
@@ -304,7 +345,6 @@ if (!$more_available && empty($max_id)) $stop_reason = 'reached_end';
 elseif (!$more_available) $stop_reason = 'no_more_available';
 elseif (empty($max_id)) $stop_reason = 'no_next_cursor';
 elseif ($consecutive_empty >= 3) $stop_reason = 'empty_pages';
-elseif ($consecutive_fails >= 2) $stop_reason = 'request_failures';
 
 log_msg("============ DONE @$username v" . SCRIPT_VERSION . " ============");
 log_msg("URLs=" . count($all_urls) . " | Pages=$page_n | Time={$duration}s | Retries=$total_retries | RateLimits=$rate_limit_hits | Stop=$stop_reason");
@@ -419,15 +459,11 @@ function try_graphql($user_id, $username, $start_time, $debug) {
         return null;
     }
 
-    log_msg("[GQL] First page: " . count($edges) . " edges — using GraphQL mode");
+    log_msg("[GQL] First page: " . count($edges) . " edges");
 
     $all_urls = [];
     $seen = [];
     $page_n = 0;
-    $has_next = true;
-    $end_cursor = '';
-
-    // Process first batch
     $has_next = $media_data['page_info']['has_next_page'] ?? false;
     $end_cursor = $media_data['page_info']['end_cursor'] ?? '';
 
@@ -444,11 +480,6 @@ function try_graphql($user_id, $username, $start_time, $debug) {
     $page_n = 1;
     log_msg("[GQL PAGE 1] +" . count($all_urls) . " URLs | more=" . ($has_next ? 'Y' : 'N'));
 
-    if (count($all_urls) > 0) {
-        log_msg("[GQL PAGE 1] Sample: " . $all_urls[0]);
-    }
-
-    // Paginate
     while ($has_next && $end_cursor) {
         $page_n++;
         usleep(600000 + mt_rand(0, 500000));
@@ -467,16 +498,10 @@ function try_graphql($user_id, $username, $start_time, $debug) {
 
         log_msg("[GQL PAGE $page_n] HTTP {$gr['status']} | " . strlen($gr['body']) . " bytes");
 
-        if ($gr['status'] !== 200) {
-            log_msg("[GQL PAGE $page_n] FAILED — stopping");
-            break;
-        }
+        if ($gr['status'] !== 200) break;
 
         $gd = json_decode($gr['body'], true);
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            log_msg("[GQL PAGE $page_n] JSON error — stopping");
-            break;
-        }
+        if (json_last_error() !== JSON_ERROR_NONE) break;
 
         $md = $gd['data']['user']['edge_owner_to_timeline_media'] ?? [];
         $gedges = $md['edges'] ?? [];
@@ -497,25 +522,11 @@ function try_graphql($user_id, $username, $start_time, $debug) {
         }
 
         log_msg("[GQL PAGE $page_n] +$nc new | total=" . count($all_urls) . " | more=" . ($has_next ? 'Y' : 'N'));
-
-        if ($nc > 0) {
-            log_msg("[GQL PAGE $page_n] Sample: " . $all_urls[count($all_urls) - $nc]);
-        }
-
-        if ($nc === 0) {
-            log_msg("[GQL PAGE $page_n] Empty — stopping");
-            break;
-        }
-
-        if ($page_n % 25 === 0) {
-            $elapsed = round(microtime(true) - $start_time, 1);
-            log_msg("──── GQL PROGRESS: $page_n pages | " . count($all_urls) . " URLs | {$elapsed}s ────");
-        }
+        if ($nc === 0) break;
     }
 
     $duration = round(microtime(true) - $start_time, 2);
-    log_msg("============ DONE (GraphQL) @$username v" . SCRIPT_VERSION . " ============");
-    log_msg("URLs=" . count($all_urls) . " | Pages=$page_n | Time={$duration}s");
+    log_msg("[GQL] DONE: " . count($all_urls) . " URLs in {$duration}s");
 
     return [
         'username' => $username,
@@ -584,5 +595,5 @@ function item_to_url($item) {
     return "https://www.instagram.com/p/$sc/";
 }
 
-// VERSION: 2.2
+// VERSION: 2.3
 ?>
